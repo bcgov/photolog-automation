@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest==8.3.3
+# pyinstaller is installed directly by CI (see .github/workflows/build.yml)
+# Do not add it here — it is only needed on the Windows build runner.
