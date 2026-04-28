@@ -24,6 +24,7 @@ from photolog import __version__
 from photolog.core import dev, paths
 from photolog.core.fs import DiskStats
 from photolog.ui.copy_tab import CopyTab
+from photolog.ui.full_tab import FullTab
 from photolog.ui.setup_dialog import SetupDialog
 from photolog.ui.thumb_tab import ThumbTab
 from photolog.ui.widgets import StatsFooter
@@ -45,9 +46,12 @@ class PhotologApp(ctk.CTk):
 
         self._tabs = ctk.CTkTabview(self)
         self._tabs.pack(fill="both", expand=True, padx=8, pady=(6, 0))
+        self._tabs.add("Full ingest")
         self._tabs.add("Copy from USB")
         self._tabs.add("Generate Thumbnails")
 
+        self.full_tab = FullTab(self._tabs.tab("Full ingest"))
+        self.full_tab.pack(fill="both", expand=True)
         self.copy_tab = CopyTab(self._tabs.tab("Copy from USB"))
         self.copy_tab.pack(fill="both", expand=True)
         self.thumb_tab = ThumbTab(self._tabs.tab("Generate Thumbnails"))
@@ -77,10 +81,11 @@ class PhotologApp(ctk.CTk):
 
     def _on_close(self) -> None:
         """Cancel any running jobs so they can flush their manifests, then quit."""
+        self.full_tab._cancel.set()
         self.copy_tab._cancel.set()
         self.thumb_tab._cancel.set()
         # Give each worker up to 2 s to flush; daemon threads won't block exit.
-        for tab in (self.copy_tab, self.thumb_tab):
+        for tab in (self.full_tab, self.copy_tab, self.thumb_tab):
             w = getattr(tab, "_worker", None)
             if w and w.is_alive():
                 w.join(timeout=2.0)
@@ -94,6 +99,7 @@ class PhotologApp(ctk.CTk):
     def _on_config_saved(self) -> None:
         # Tabs cache nothing that survives a config change except widget vars;
         # pulling fresh values on the next refresh is enough.
+        self.full_tab.refresh_from_config()
         self.copy_tab.refresh_from_config()
         self.thumb_tab.refresh_from_config()
 
