@@ -197,8 +197,10 @@ class ThumbJob:
         # the directory onto the *input path as given on the command line*.
         # So we MUST pass bare filenames (and set cwd to the segment folder)
         # — absolute inputs would produce `<dst>/<abs src path>`.
-        use_glob = len(pending) >= max(4, int(0.8 * len(images)))
-        cmd: list[str] = [
+        # We always enumerate filenames explicitly: gm.exe on Windows does not
+        # expand `*.jpg` itself (the Unix build does, which is why glob worked
+        # on Mac and failed on the Windows VM with "Unable to open file (*.jpg)").
+        cmd_base: list[str] = [
             str(self.plan.gm_exe),
             "mogrify",
             "-output-directory",
@@ -208,27 +210,26 @@ class ThumbJob:
             "-quality",
             THUMB_QUALITY,
         ]
-        if use_glob:
-            cmd.append("*.jpg")
-        else:
-            cmd.extend(p.name for p in pending)
 
-        try:
-            completed = subprocess.run(
-                cmd, cwd=str(seg.source_folder), capture_output=True, text=True, timeout=3600
-            )
-        except subprocess.TimeoutExpired:
-            return _SegmentResult(name=seg.name, ok=False, skipped=skipped, error="gm timeout")
-        except OSError as e:
-            return _SegmentResult(name=seg.name, ok=False, skipped=skipped, error=f"gm spawn error: {e}")
+        for batch in _batch_filenames([p.name for p in pending], cmd_base):
+            cmd = cmd_base + batch
+            try:
+                completed = subprocess.run(
+                    cmd, cwd=str(seg.source_folder), capture_output=True, text=True, timeout=3600
+                )
+            except subprocess.TimeoutExpired:
+                return _SegmentResult(name=seg.name, ok=False, skipped=skipped, failed=len(pending), error="gm timeout")
+            except OSError as e:
+                return _SegmentResult(name=seg.name, ok=False, skipped=skipped, failed=len(pending), error=f"gm spawn error: {e}")
 
-        if completed.returncode != 0:
-            return _SegmentResult(
-                name=seg.name,
-                ok=False,
-                skipped=skipped,
-                error=(completed.stderr or completed.stdout or "").strip()[:400],
-            )
+            if completed.returncode != 0:
+                return _SegmentResult(
+                    name=seg.name,
+                    ok=False,
+                    skipped=skipped,
+                    failed=len(pending),
+                    error=(completed.stderr or completed.stdout or "").strip()[:400],
+                )
 
         # Verify each expected thumb exists, count generated vs failed.
         generated = 0
@@ -319,3 +320,29 @@ def _thumb_is_fresh(thumb: Path, source: Path) -> bool:
     except OSError:
         return False
     return t.st_size > 0 and t.st_mtime >= s.st_mtime
+
+
+# Windows CreateProcess caps the command line at 32,767 chars including the exe
+# path and quoting overhead. Stay well under that to leave room for cmd_base.
+_MAX_CMDLINE = 28000
+
+
+def _batch_filenames(filenames: list[str], cmd_base: list[str]) -> list[list[str]]:
+    """Split filenames into chunks whose total argv length stays under the OS limit."""
+    if not filenames:
+        return []
+    base_len = sum(len(a) + 3 for a in cmd_base)  # +3 ≈ quotes + separator
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_len = base_len
+    for name in filenames:
+        cost = len(name) + 3
+        if current and current_len + cost > _MAX_CMDLINE:
+            batches.append(current)
+            current = []
+            current_len = base_len
+        current.append(name)
+        current_len += cost
+    if current:
+        batches.append(current)
+    return batches
