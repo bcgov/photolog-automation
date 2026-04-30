@@ -90,11 +90,20 @@ class CopyJob:
 
     def run(self) -> None:
         try:
-            self._emit("scanning", "Scanning source…")
-            self._scan_or_resume()
+            # Allow callers (e.g. the Full ingest tab) to pre-scan so they can
+            # quote file/byte totals in a "started" notification before the
+            # engine begins doing real I/O. Scanning is idempotent but walks
+            # the whole source tree, so we don't want to do it twice.
+            if not self._files:
+                self._emit("scanning", "Scanning source…")
+                self._scan_or_resume()
             self._bytes_total = sum(f.size for f in self._files)
             self._bytes_done = sum(f.size for f in self._files if f.state == "done")
             self._files_done = sum(1 for f in self._files if f.state == "done")
+            # Check destination has enough free space before starting copy
+            bytes_remaining = self._bytes_total - self._bytes_done
+            if not self._check_disk_space(bytes_remaining):
+                return
             self._emit("copying", f"Copying {len(self._files)} files…")
             self._copy_all()
             if self.cancel.is_set():
@@ -152,10 +161,15 @@ class CopyJob:
 
     def _copy_all(self) -> None:
         self._samples.append((time.monotonic(), self._bytes_done, self._files_done))
-        for entry in self._files:
+        for i, entry in enumerate(self._files):
             if self.cancel.is_set():
                 return
             self._await_unpause()
+            # Check disk space every 10 files (expensive on large runs, so sample)
+            if i % 10 == 0:
+                bytes_remaining = sum(f.size for f in self._files[i:] if f.state != "done")
+                if not self._check_disk_space(bytes_remaining, critical=True):
+                    return
             try:
                 self._process_entry(entry)
             except Exception as e:  # noqa: BLE001
@@ -200,8 +214,14 @@ class CopyJob:
         if partial.exists():
             try:
                 partial.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                # Attempt to remove orphaned partial file; if it persists, warn but continue
+                if partial.exists():
+                    self._emit(
+                        "copying",
+                        f"Warning: failed to clean up partial file {partial.name}: {e}",
+                        warning=f"{entry.rel}: partial cleanup failed",
+                    )
 
         dst.parent.mkdir(parents=True, exist_ok=True)
         entry.state = "partial"
@@ -253,6 +273,29 @@ class CopyJob:
         except InterruptedError:
             return False
 
+    # ---------- disk space checks ----------
+
+    def _check_disk_space(self, bytes_remaining: int, critical: bool = False) -> bool:
+        """Check if destination has enough free space. Returns True if OK, False if aborting."""
+        try:
+            u = __import__("shutil").disk_usage(str(self.plan.dest_root))
+            free = u.free
+        except OSError:
+            # Can't check free space; proceed optimistically
+            return True
+        # Require 1.5× the remaining bytes as safety margin
+        required = int(bytes_remaining * 1.5)
+        if free < required:
+            msg = (
+                f"Insufficient disk space: {fs.human_bytes(free)} free, but "
+                f"{fs.human_bytes(bytes_remaining)} still to copy. Aborting."
+            )
+            self._emit("error", msg)
+            self.cancel.set()
+            self._flush_manifest(force=True)
+            return False
+        return True
+
     # ---------- verify ----------
 
     def _verify(self) -> None:
@@ -283,8 +326,10 @@ class CopyJob:
         }
         try:
             manifest.write_manifest(self.manifest_path, data)
-        except OSError as e:
-            self._emit("copying", f"Manifest write failed: {e}", warning=str(e))
+        except Exception as e:  # noqa: BLE001
+            # Manifest write failure is critical; report and halt the job
+            self._emit("error", f"Manifest write failed (job halted): {e}")
+            self.cancel.set()
         self._flush_counter = 0
         self._last_flush_t = time.monotonic()
 

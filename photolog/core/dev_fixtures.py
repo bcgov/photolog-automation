@@ -16,6 +16,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from photolog.core.fs import NO_WINDOW_FLAGS
+
 # Size knob → (width, height, quality) chosen to land near the requested MB.
 # gm convert xc:rgb(...) produces highly compressible output; bumping quality
 # is the knob that actually grows the file.
@@ -125,6 +127,7 @@ def seed_sim_tree(
                     str(dst),
                 ],
                 check=True, capture_output=True,
+                creationflags=NO_WINDOW_FLAGS,
             )
             total_bytes += dst.stat().st_size
             images += 1

@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 HASH_CHUNK = 1 << 20  # 1 MiB
 COPY_CHUNK = 4 << 20  # 4 MiB
 MTIME_TOL_S = 2.0  # FAT/SMB mtime granularity
+
+# Pass to subprocess(creationflags=...) to keep GUI builds quiet on Windows:
+# gm.exe and cmd.exe are console-subsystem binaries, so when a --windowed
+# parent spawns them Windows allocates a new console window unless we set
+# CREATE_NO_WINDOW (0x08000000). On non-Windows the flag is 0 and ignored.
+NO_WINDOW_FLAGS = 0x08000000 if sys.platform.startswith("win") else 0
 
 
 def sha256_file(path: Path, cancel=None) -> str:

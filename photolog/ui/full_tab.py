@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +23,7 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from photolog.core import junctions, paths
+from photolog.core import junctions, notify, paths
 from photolog.core.copy_detect import CopyInterpretation
 from photolog.core.copy_detect import Refusal as CopyRefusal
 from photolog.core.copy_detect import interpret_copy_source
@@ -34,6 +35,8 @@ from photolog.core.thumb_detect import interpret_thumb_source
 from photolog.core.thumb_job import DEFAULT_WORKERS, ThumbJob, ThumbPlan
 from photolog.ui.preflight import PreflightCard
 from photolog.ui.widgets import LogPane, ProgressBlock
+
+JOB_KIND = "Full ingest"
 
 # Sub-jobs emit phase="done" when they finish their part. In this tab those
 # are phase transitions, not terminal. This sentinel — enqueued only by the
@@ -232,14 +235,35 @@ class FullTab(ctk.CTkFrame):
         plan = CopyPlan(source_root=interp.source_root, dest_root=dest, year=interp.year)
         self._log(f"Starting full ingest: {interp.source_root} -> {dest}")
         self._set_running(True)
-        self._worker = threading.Thread(target=self._run, args=(plan,), daemon=True)
+        self._worker = threading.Thread(target=self._run, args=(plan,), daemon=False)
         self._worker.start()
 
     def _run(self, plan: CopyPlan) -> None:
+        started_at = time.monotonic()
+        report = notify.JobReport(outcome="ok")
+        copy_job: CopyJob | None = None
+        thumb_job: ThumbJob | None = None
+        segments_count: int | None = None
         try:
             # Phase 1 — copy
-            CopyJob(plan, self._q, self._cancel, self._pause).run()
+            copy_job = CopyJob(plan, self._q, self._cancel, self._pause)
+            # Engine scans first; fire the start notification with the file
+            # count it just discovered. Worst case (scan fails) we still send
+            # a start with zeros from the finally block — better than silence.
+            copy_job._scan_or_resume()  # noqa: SLF001 — internal but stable
+            files_total = len(copy_job._files)  # noqa: SLF001
+            bytes_total = sum(f.size for f in copy_job._files)  # noqa: SLF001
+            notify.send_started(
+                job_kind=JOB_KIND, year=plan.year,
+                source=str(plan.source_root), dest=str(plan.dest_root),
+                files_total=files_total, bytes_total=bytes_total,
+            )
+            # Finish the copy proper. _scan_or_resume() above is idempotent —
+            # the engine's run() will redo it but that's a fast no-op vs. the
+            # actual byte work that follows.
+            copy_job.run()
             if self._cancel.is_set():
+                report.outcome = "cancelled"
                 self._enqueue("cancelled", "Full ingest cancelled during copy.")
                 return
 
@@ -258,10 +282,14 @@ class FullTab(ctk.CTkFrame):
                 result = junctions.ensure_junction(link, hr_folder)
                 self._enqueue("linking", f"HR junction {result}: {link} -> {hr_folder}")
             except junctions.JunctionConflict as e:
-                self._enqueue("error", f"HR junction conflict: {e}")
+                report.outcome = "error"
+                report.error = f"HR junction conflict: {e}"
+                self._enqueue("error", report.error)
                 return
             except Exception as e:  # noqa: BLE001
-                self._enqueue("error", f"HR junction error: {e}")
+                report.outcome = "error"
+                report.error = f"HR junction error: {e}"
+                self._enqueue("error", report.error)
                 return
 
             # Phase 3 — interpret the just-copied year folder as a thumb source
@@ -284,6 +312,8 @@ class FullTab(ctk.CTkFrame):
                 tn_dest = paths.year_tn_root(plan.year)
                 gm_exe = paths.gm_executable()
             except RuntimeError as e:
+                report.outcome = "error"
+                report.error = str(e)
                 self._enqueue("error", str(e))
                 return
             try:
@@ -296,15 +326,20 @@ class FullTab(ctk.CTkFrame):
                     workers=DEFAULT_WORKERS,
                 )
             except ValueError as e:
-                self._enqueue("error", f"Thumb plan invalid: {e}")
+                report.outcome = "error"
+                report.error = f"Thumb plan invalid: {e}"
+                self._enqueue("error", report.error)
                 return
 
+            segments_count = len(thumb_plan.segments)
             self._enqueue(
                 "copying",
-                f"Starting thumbnails: {len(thumb_plan.segments)} segment(s) -> {tn_dest}",
+                f"Starting thumbnails: {segments_count} segment(s) -> {tn_dest}",
             )
-            ThumbJob(thumb_plan, self._q, self._cancel).run()
+            thumb_job = ThumbJob(thumb_plan, self._q, self._cancel)
+            thumb_job.run()
             if self._cancel.is_set():
+                report.outcome = "cancelled"
                 self._enqueue("cancelled", "Full ingest cancelled during thumbnails.")
                 return
 
@@ -314,15 +349,54 @@ class FullTab(ctk.CTkFrame):
                 result = junctions.ensure_junction(tn_link, tn_dest)
                 self._enqueue("linking", f"TN junction {result}: {tn_link} -> {tn_dest}")
             except junctions.JunctionConflict as e:
-                self._enqueue("error", f"TN junction conflict: {e}")
+                report.outcome = "error"
+                report.error = f"TN junction conflict: {e}"
+                self._enqueue("error", report.error)
                 return
             except Exception as e:  # noqa: BLE001
-                self._enqueue("error", f"TN junction error: {e}")
+                report.outcome = "error"
+                report.error = f"TN junction error: {e}"
+                self._enqueue("error", report.error)
                 return
 
             self._enqueue(_INGEST_DONE, "Full ingest complete.")
         except Exception as e:  # noqa: BLE001
-            self._enqueue("error", f"Full ingest failed: {e}")
+            report.outcome = "error"
+            report.error = f"Full ingest failed: {e}"
+            self._enqueue("error", report.error)
+        finally:
+            self._send_finished(plan, copy_job, thumb_job, segments_count, report, started_at)
+
+    def _send_finished(
+        self,
+        plan: CopyPlan,
+        copy_job: CopyJob | None,
+        thumb_job: ThumbJob | None,
+        segments_count: int | None,
+        report: notify.JobReport,
+        started_at: float,
+    ) -> None:
+        # Aggregate copy + thumb stats. Files are summed across both phases so
+        # a recipient sees one combined success/failure picture; bytes are
+        # only meaningful for the copy phase (thumb job tracks files only).
+        if copy_job is not None:
+            report.files_total += len(copy_job._files)  # noqa: SLF001
+            report.files_done += copy_job._files_done  # noqa: SLF001
+            report.files_skipped += copy_job._files_skipped  # noqa: SLF001
+            report.files_failed += copy_job._files_failed  # noqa: SLF001
+            report.bytes_total = copy_job._bytes_total  # noqa: SLF001
+            report.bytes_done = copy_job._bytes_done  # noqa: SLF001
+        if thumb_job is not None:
+            report.files_total += thumb_job._files_total  # noqa: SLF001
+            report.files_done += thumb_job._files_done  # noqa: SLF001
+            report.files_skipped += thumb_job._files_skipped  # noqa: SLF001
+            report.files_failed += thumb_job._files_failed  # noqa: SLF001
+        report.duration_s = time.monotonic() - started_at
+        notify.send_finished(
+            job_kind=JOB_KIND, year=plan.year,
+            source=str(plan.source_root), dest=str(plan.dest_root),
+            report=report, segments=segments_count,
+        )
 
     def _enqueue(self, phase: str, message: str, *, warnings: list[str] | None = None) -> None:
         ev = ProgressEvent(phase=phase, message=message)  # type: ignore[arg-type]

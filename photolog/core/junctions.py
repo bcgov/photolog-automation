@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from photolog.core.fs import NO_WINDOW_FLAGS
 from photolog.core.paths import IS_WINDOWS
 
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -69,6 +70,7 @@ def ensure_junction(link: Path, target: Path) -> str:
             capture_output=True,
             text=True,
             check=False,
+            creationflags=NO_WINDOW_FLAGS,
         )
         if completed.returncode != 0:
             raise RuntimeError(

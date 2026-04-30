@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -17,13 +18,15 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from photolog.core import junctions, paths
+from photolog.core import junctions, notify, paths
 from photolog.core.events import ProgressEvent
 from photolog.core.fs import human_bytes, human_duration
 from photolog.core.thumb_detect import Refusal, ThumbInterpretation, interpret_thumb_source
 from photolog.core.thumb_job import DEFAULT_WORKERS, ThumbJob, ThumbPlan
 from photolog.ui.preflight import PreflightCard
 from photolog.ui.widgets import LogPane, ProgressBlock
+
+JOB_KIND = "Thumbnail generation"
 
 
 class ThumbTab(ctk.CTkFrame):
@@ -227,25 +230,56 @@ class ThumbTab(ctk.CTkFrame):
         self._set_running(True)
         self._year = year
         self._dest = dest_folder
-        self._worker = threading.Thread(target=self._run, args=(plan,), daemon=True)
+        self._worker = threading.Thread(target=self._run, args=(plan,), daemon=False)
         self._worker.start()
 
     def _run(self, plan: ThumbPlan) -> None:
+        started_at = time.monotonic()
+        report = notify.JobReport(outcome="ok")
         job = ThumbJob(plan, self._q, self._cancel)
-        job.run()
-        if not self._cancel.is_set():
-            try:
-                link = paths.tn_link_root() / str(self._year)
-                result = junctions.ensure_junction(link, self._dest)
-                self._q.put(ProgressEvent(
-                    phase="linking",
-                    message=f"TN junction {result}: {link} -> {self._dest}",
-                ))
-            except junctions.JunctionConflict as e:
-                self._q.put(ProgressEvent(phase="error", message=f"Junction conflict: {e}"))
-            except Exception as e:  # noqa: BLE001
-                self._q.put(ProgressEvent(phase="error", message=f"Junction error: {e}"))
-        self._q.put(ProgressEvent(phase="done", message="(job thread exiting)"))
+        try:
+            files_total = sum(s.image_count for s in plan.segments)
+            bytes_total = sum(s.bytes_total for s in plan.segments)
+            source_label = str(plan.segments[0].source_folder.parent) if plan.segments else ""
+            notify.send_started(
+                job_kind=JOB_KIND, year=self._year,
+                source=source_label,
+                dest=str(plan.dest_folder),
+                files_total=files_total, bytes_total=bytes_total,
+                segments=len(plan.segments),
+            )
+            job.run()
+            if self._cancel.is_set():
+                report.outcome = "cancelled"
+            else:
+                try:
+                    link = paths.tn_link_root() / str(self._year)
+                    result = junctions.ensure_junction(link, self._dest)
+                    self._q.put(ProgressEvent(
+                        phase="linking",
+                        message=f"TN junction {result}: {link} -> {self._dest}",
+                    ))
+                except junctions.JunctionConflict as e:
+                    report.outcome = "error"
+                    report.error = f"Junction conflict: {e}"
+                    self._q.put(ProgressEvent(phase="error", message=report.error))
+                except Exception as e:  # noqa: BLE001
+                    report.outcome = "error"
+                    report.error = f"Junction error: {e}"
+                    self._q.put(ProgressEvent(phase="error", message=report.error))
+            self._q.put(ProgressEvent(phase="done", message="(job thread exiting)"))
+        finally:
+            report.files_total = job._files_total  # noqa: SLF001
+            report.files_done = job._files_done  # noqa: SLF001
+            report.files_skipped = job._files_skipped  # noqa: SLF001
+            report.files_failed = job._files_failed  # noqa: SLF001
+            report.duration_s = time.monotonic() - started_at
+            notify.send_finished(
+                job_kind=JOB_KIND, year=self._year,
+                source=source_label,
+                dest=str(plan.dest_folder),
+                report=report, segments=len(plan.segments),
+            )
 
     def _cancel_job(self) -> None:
         if messagebox.askyesno("Cancel", "Cancel thumbnail generation?"):

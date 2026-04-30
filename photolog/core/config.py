@@ -30,8 +30,11 @@ class MachineConfig:
     hr_link_root: str = ""      # e.g. H:\PLGwww\hr
     tn_link_root: str = ""      # e.g. H:\PLGwww\TN
     gm_exe: str = ""            # e.g. N:\RPM\TN\GraphicsMagick-1.3.23-Q8\gm.exe
+    notify_sender: str = ""     # From: address for job notification emails (optional)
+    notify_recipient: str = ""  # To: address for job notification emails (optional)
 
     def is_complete(self) -> bool:
+        # Notify fields are optional — leaving them blank disables email.
         return all([self.hr_root, self.tn_root, self.hr_link_root, self.tn_link_root, self.gm_exe])
 
 
@@ -93,6 +96,8 @@ def load_config() -> AppConfig:
                     hr_link_root=str(v.get("hr_link_root", "")),
                     tn_link_root=str(v.get("tn_link_root", "")),
                     gm_exe=str(v.get("gm_exe", "")),
+                    notify_sender=str(v.get("notify_sender", "")),
+                    notify_recipient=str(v.get("notify_recipient", "")),
                 )
     return AppConfig(machines=machines)
 

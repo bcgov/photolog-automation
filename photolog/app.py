@@ -33,6 +33,8 @@ from photolog.ui.widgets import StatsFooter
 class PhotologApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
+        # Clean up any orphaned temp/partial files from prior crashes
+        paths.cleanup_orphaned_files()
         self.title(f"Photolog {__version__}")
         self.geometry("960x700")
         self.minsize(820, 560)
@@ -80,15 +82,37 @@ class PhotologApp(ctk.CTk):
     # ---------- shutdown ----------
 
     def _on_close(self) -> None:
-        """Cancel any running jobs so they can flush their manifests, then quit."""
+        """Graceful shutdown: cancel jobs, wait for workers to flush and finish."""
+        # Phase 1: Set cancel events on all tabs to signal workers to stop gracefully
         self.full_tab._cancel.set()
         self.copy_tab._cancel.set()
         self.thumb_tab._cancel.set()
-        # Give each worker up to 2 s to flush; daemon threads won't block exit.
+
+        # Phase 2: Wait up to 10s for threads to complete (workers should flush manifests
+        # on cancel via _flush_manifest calls in copy_job.run() and thumb_job.run()).
         for tab in (self.full_tab, self.copy_tab, self.thumb_tab):
             w = getattr(tab, "_worker", None)
             if w and w.is_alive():
-                w.join(timeout=2.0)
+                w.join(timeout=10.0)
+
+        # Phase 3: Wait another 20s to ensure all threads terminate
+        for tab in (self.full_tab, self.copy_tab, self.thumb_tab):
+            w = getattr(tab, "_worker", None)
+            if w and w.is_alive():
+                w.join(timeout=20.0)
+
+        # Phase 4: If any threads still alive after 30s total, log warning but proceed
+        alive_threads = [
+            tab.__class__.__name__
+            for tab in (self.full_tab, self.copy_tab, self.thumb_tab)
+            if getattr(tab, "_worker", None) and getattr(tab, "_worker").is_alive()
+        ]
+        if alive_threads:
+            print(
+                f"Warning: {len(alive_threads)} worker thread(s) still alive after 30s: {alive_threads}",
+                file=__import__("sys").stderr,
+            )
+
         self.destroy()
 
     # ---------- setup / settings ----------

@@ -21,6 +21,7 @@ from pathlib import Path
 
 from photolog.core import dev, manifest
 from photolog.core.events import ProgressEvent
+from photolog.core.fs import NO_WINDOW_FLAGS
 from photolog.core.thumb_detect import IMAGE_EXTS, SegmentSpec
 
 MANIFEST_NAME = ".photolog-thumb-manifest.json"
@@ -215,7 +216,12 @@ class ThumbJob:
             cmd = cmd_base + batch
             try:
                 completed = subprocess.run(
-                    cmd, cwd=str(seg.source_folder), capture_output=True, text=True, timeout=3600
+                    cmd,
+                    cwd=str(seg.source_folder),
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,
+                    creationflags=NO_WINDOW_FLAGS,
                 )
             except subprocess.TimeoutExpired:
                 return _SegmentResult(name=seg.name, ok=False, skipped=skipped, failed=len(pending), error="gm timeout")
@@ -263,8 +269,9 @@ class ThumbJob:
         }
         try:
             manifest.write_manifest(self.plan.dest_folder / MANIFEST_NAME, data)
-        except OSError:
-            pass
+        except Exception as e:  # noqa: BLE001
+            self._emit("error", f"Manifest write failed: {e}")
+            self.cancel.set()
 
     def _emit(self, phase: str, message: str = "") -> None:
         self.q.put(self._make_event(phase, message))

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -18,13 +19,15 @@ from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 
-from photolog.core import junctions, paths
+from photolog.core import junctions, notify, paths
 from photolog.core.copy_detect import CopyInterpretation, Refusal, interpret_copy_source
 from photolog.core.copy_job import MANIFEST_NAME, CopyJob, CopyPlan
 from photolog.core.events import ProgressEvent
 from photolog.core.fs import human_bytes, human_duration
 from photolog.ui.preflight import PreflightCard
 from photolog.ui.widgets import LogPane, ProgressBlock
+
+JOB_KIND = "Copy"
 
 
 class CopyTab(ctk.CTkFrame):
@@ -216,33 +219,70 @@ class CopyTab(ctk.CTkFrame):
         plan = CopyPlan(source_root=interp.source_root, dest_root=dest, year=interp.year)
         self._log(f"Starting copy: {interp.source_root} -> {dest}")
         self._set_running(True)
-        self._worker = threading.Thread(target=self._run, args=(plan,), daemon=True)
+        self._worker = threading.Thread(target=self._run, args=(plan,), daemon=False)
         self._worker.start()
 
     def _run(self, plan: CopyPlan) -> None:
+        started_at = time.monotonic()
+        report = notify.JobReport(outcome="ok")
         job = CopyJob(plan, self._q, self._cancel, self._pause)
-        job.run()
-        if not self._cancel.is_set():
+        try:
+            # Pre-scan so we can send a useful "started" mail with file/byte
+            # totals before the long copy phase begins. CopyJob.run() skips
+            # its own scan if _files is already populated.
             try:
-                hr_folder = paths.find_highway_images_folder(plan.dest_root, plan.year)
-                if hr_folder is None:
-                    self._q.put(ProgressEvent(
-                        phase="done",
-                        message=f"Copy complete. No '{plan.year} Highway Images' folder found; skipping HR junction.",
-                        warnings=[f"Missing {plan.year} Highway Images"],
-                    ))
-                else:
-                    link = paths.hr_link_root() / str(plan.year)
-                    result = junctions.ensure_junction(link, hr_folder)
-                    self._q.put(ProgressEvent(
-                        phase="linking",
-                        message=f"HR junction {result}: {link} -> {hr_folder}",
-                    ))
-            except junctions.JunctionConflict as e:
-                self._q.put(ProgressEvent(phase="error", message=f"Junction conflict: {e}"))
-            except Exception as e:  # noqa: BLE001
-                self._q.put(ProgressEvent(phase="error", message=f"Junction error: {e}"))
-        self._q.put(ProgressEvent(phase="done", message="(job thread exiting)"))
+                job._scan_or_resume()  # noqa: SLF001
+                files_total = len(job._files)  # noqa: SLF001
+                bytes_total = sum(f.size for f in job._files)  # noqa: SLF001
+            except Exception:  # noqa: BLE001 — start mail is best-effort
+                files_total = 0
+                bytes_total = 0
+            notify.send_started(
+                job_kind=JOB_KIND, year=plan.year,
+                source=str(plan.source_root), dest=str(plan.dest_root),
+                files_total=files_total, bytes_total=bytes_total,
+            )
+            job.run()
+            if self._cancel.is_set():
+                report.outcome = "cancelled"
+            else:
+                try:
+                    hr_folder = paths.find_highway_images_folder(plan.dest_root, plan.year)
+                    if hr_folder is None:
+                        self._q.put(ProgressEvent(
+                            phase="done",
+                            message=f"Copy complete. No '{plan.year} Highway Images' folder found; skipping HR junction.",
+                            warnings=[f"Missing {plan.year} Highway Images"],
+                        ))
+                    else:
+                        link = paths.hr_link_root() / str(plan.year)
+                        result = junctions.ensure_junction(link, hr_folder)
+                        self._q.put(ProgressEvent(
+                            phase="linking",
+                            message=f"HR junction {result}: {link} -> {hr_folder}",
+                        ))
+                except junctions.JunctionConflict as e:
+                    report.outcome = "error"
+                    report.error = f"Junction conflict: {e}"
+                    self._q.put(ProgressEvent(phase="error", message=report.error))
+                except Exception as e:  # noqa: BLE001
+                    report.outcome = "error"
+                    report.error = f"Junction error: {e}"
+                    self._q.put(ProgressEvent(phase="error", message=report.error))
+            self._q.put(ProgressEvent(phase="done", message="(job thread exiting)"))
+        finally:
+            report.files_total = len(job._files)  # noqa: SLF001
+            report.files_done = job._files_done  # noqa: SLF001
+            report.files_skipped = job._files_skipped  # noqa: SLF001
+            report.files_failed = job._files_failed  # noqa: SLF001
+            report.bytes_total = job._bytes_total  # noqa: SLF001
+            report.bytes_done = job._bytes_done  # noqa: SLF001
+            report.duration_s = time.monotonic() - started_at
+            notify.send_finished(
+                job_kind=JOB_KIND, year=plan.year,
+                source=str(plan.source_root), dest=str(plan.dest_root),
+                report=report,
+            )
 
     def _toggle_pause(self) -> None:
         if self._pause.is_set():
