@@ -237,10 +237,12 @@ class ThumbTab(ctk.CTkFrame):
         started_at = time.monotonic()
         report = notify.JobReport(outcome="ok")
         job = ThumbJob(plan, self._q, self._cancel)
+        # Resolve before the try so the finally's notify.send_finished() never
+        # NameErrors if an early exception fires before this would be assigned.
+        source_label = str(plan.segments[0].source_folder.parent) if plan.segments else ""
         try:
             files_total = sum(s.image_count for s in plan.segments)
             bytes_total = sum(s.bytes_total for s in plan.segments)
-            source_label = str(plan.segments[0].source_folder.parent) if plan.segments else ""
             notify.send_started(
                 job_kind=JOB_KIND, year=self._year,
                 source=source_label,

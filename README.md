@@ -29,18 +29,19 @@ python -m pip install -r requirements-dev.txt
 # Confirm this Python has Tk support:
 python -c "import tkinter; print(tkinter.TkVersion)"
 
-# Point simulated drive roots anywhere writable:
-export PHOTOLOG_N=$HOME/photolog-sim/N
-export PHOTOLOG_H=$HOME/photolog-sim/H
-export PHOTOLOG_GM=$(which gm)
-mkdir -p "$PHOTOLOG_N" "$PHOTOLOG_H/hr" "$PHOTOLOG_H/TN" "$PHOTOLOG_N/TN"
-
-python -m photolog
+python -m photolog --dev
 ```
 
-If you build the venv with a different Homebrew Python, install the matching Tk package first, for example `brew install python-tk@3.14` for Python 3.14.
+Then in the app, open the **Dev** tab and click **"Use sim tree paths"** (auto-creates the sim directory structure and writes to your config). Click **"Seed"** to populate fake segments.
 
-On Windows these env vars are unused and real `N:\RPMS$` / `H:\PLGwww` paths apply.
+**Optional:** If you need to override paths for testing, set env vars (rarely needed once config is set):
+```sh
+export PHOTOLOG_HR=$HOME/my-test-hr
+export PHOTOLOG_GM=$(which gm)
+python -m photolog --dev
+```
+
+If you build the venv with a different Homebrew Python, install the matching Tk package first (e.g., `brew install python-tk@3.14` for Python 3.14).
 
 ## Manifest / resume
 
@@ -50,3 +51,30 @@ On Windows these env vars are unused and real `N:\RPMS$` / `H:\PLGwww` paths app
 ## Junctions
 
 Created with `cmd /c mklink /J` on Windows (no admin required) and emulated with symlinks in the dev loop. If a link already exists pointing at a different target, the job aborts and surfaces the conflict rather than silently re-pointing.
+
+## Crash recovery & unattended operation
+
+Photolog is designed to survive unattended operation on Windows Server with graceful recovery from crashes and failures:
+
+**Startup safety:**
+- Orphaned temp files (`*.tmp`) and partial sidecars (`*.photolog-partial`) from prior crashes are cleaned up automatically.
+- Corrupted manifests are rotated to `.json.corrupt` and the job restarts fresh.
+
+**During operation:**
+- Disk space is checked before copy starts (requires 1.5× source size free) and every 10 files during copy.
+- Insufficient space halts the job cleanly, leaving manifests consistent for retry.
+- Manifest writes are retried up to 3 times on Windows lock failures (antivirus scanners, etc.).
+- Worker threads are non-daemon; on shutdown, the app waits up to 30 seconds for manifests to flush before exiting.
+
+**Resume behavior:**
+- Partial writes (`*.photolog-partial` sidecars) signal an incomplete file.
+- Manifest entries track state: `pending`, `partial`, `done`.
+- Rerunning the app resumes exactly where it left off; identical files (by size + mtime) are skipped.
+- If a destination file exists but doesn't match the source, SHA-256 is compared to avoid wasteful recopies.
+
+**Error visibility:**
+- Manifest write failures emit error events and halt the job (previously silent).
+- Partial file cleanup failures are logged with context so ops can investigate.
+- Worker threads still alive after 30s shutdown are reported to stderr.
+
+Because there is no network at runtime and all state is persisted locally, the app can safely recover from power loss, USB disconnection, or OS crash.
