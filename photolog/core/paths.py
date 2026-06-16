@@ -225,15 +225,19 @@ def find_highway_images_folder(year_root: Path, year: int) -> Path | None:
 
 
 def cleanup_orphaned_files() -> None:
-    """Scan for and remove orphaned temp files and partial sidecars from crashed operations.
+    """Remove stale manifest temp files from crashed operations.
 
     On startup, removes:
     - *.tmp files (stale manifest temp files)
-    - *.photolog-partial sidecars with no matching destination file
+
+    Partial sidecars are intentionally not swept globally here. They can be
+    buried anywhere in a year's image tree, so finding them requires a
+    recursive walk of every configured data year on every launch. On the
+    Windows Server target that can block the UI for minutes. Copy jobs clean
+    the specific partials they need to overwrite while resuming.
+
     Failures are logged to stderr and non-fatal.
     """
-    from photolog.core import manifest as manifest_module
-
     def scan_and_clean(root: Path) -> None:
         if not root.exists():
             return
@@ -248,36 +252,6 @@ def cleanup_orphaned_files() -> None:
                         tmp_file.unlink()
                     except OSError as e:
                         print(f"Warning: failed to remove {tmp_file}: {e}", file=__import__("sys").stderr)
-
-                # Clean orphaned .photolog-partial sidecars
-                # Load the manifest to see which partials are legitimate
-                manifest_files = [
-                    year_dir / ".photolog-copy-manifest.json",
-                    year_dir / ".photolog-thumb-manifest.json",
-                ]
-                legitimate_partials = set()
-                for manifest_path in manifest_files:
-                    data = manifest_module.read_manifest(manifest_path)
-                    if data and "files" in data:
-                        for entry in data.get("files", []):
-                            if isinstance(entry, dict) and "rel" in entry:
-                                # A partial sidecar corresponds to the destination file + suffix
-                                file_rel = entry["rel"]
-                                legitimate_partials.add(file_rel)
-
-                # Find and remove orphaned partials
-                for partial_file in year_dir.rglob("*.photolog-partial"):
-                    if not partial_file.is_file():
-                        continue
-                    # Check if this corresponds to a file in the manifest
-                    rel_to_year = str(partial_file.relative_to(year_dir)).replace("\\", "/")
-                    # Remove the .photolog-partial suffix to get the original rel path
-                    rel_path = rel_to_year[: -len(".photolog-partial")] if rel_to_year.endswith(".photolog-partial") else rel_to_year
-                    if rel_path not in legitimate_partials:
-                        try:
-                            partial_file.unlink()
-                        except OSError as e:
-                            print(f"Warning: failed to remove {partial_file}: {e}", file=__import__("sys").stderr)
         except OSError as e:
             print(f"Warning: error scanning {root} for orphaned files: {e}", file=__import__("sys").stderr)
 

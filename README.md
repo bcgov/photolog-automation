@@ -57,7 +57,8 @@ Created with `cmd /c mklink /J` on Windows (no admin required) and emulated with
 Photolog is designed to survive unattended operation on Windows Server with graceful recovery from crashes and failures:
 
 **Startup safety:**
-- Orphaned temp files (`*.tmp`) and partial sidecars (`*.photolog-partial`) from prior crashes are cleaned up automatically.
+- Orphaned manifest temp files (`*.tmp`) from prior crashes are cleaned up automatically at launch.
+- Partial sidecars (`*.photolog-partial`) are cleaned as part of job resume for the specific files being copied; the app does not recursively sweep every year folder on launch.
 - Corrupted manifests are rotated to `.json.corrupt` and the job restarts fresh.
 
 **During operation:**
